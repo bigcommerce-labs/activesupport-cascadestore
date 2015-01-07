@@ -60,7 +60,16 @@ module ActiveSupport
         nil
       end
 
+      def clear(options = nil)
+        cascade(:clear, options)
+      end
+
+      def cleanup(options = nil)
+        cascade(:cleanup, options)
+      end
+
       protected
+
       def synchronize(&block) # :nodoc:
         @monitor.synchronize(&block)
       end
@@ -75,22 +84,39 @@ module ActiveSupport
 
       def read_entry(key, options) # :nodoc:
         entry = nil
-        synchronize do
-          @stores.detect do |store|
-            entry = store.send(:read_entry, key, options) rescue nil
+        if !!options[:last_store]
+          entry = @stores.last.send(:read_entry, key, options)
+        else
+          synchronize do
+            store_index = @stores.find_index do |store|
+              entry = store.send(:read_entry, key, options) rescue nil
+            end
+            write_missing_entry(key, entry, options, store_index) if store_index
           end
         end
         entry
       end
 
       def write_entry(key, entry, options) # :nodoc:
-        cascade(:write_entry, key, entry, options)
+        if !!options[:last_store]
+          @stores.last.send(:write_entry, key, entry, options)
+        else
+          cascade(:write_entry, key, entry, options)
+        end
         true
       end
 
       def delete_entry(key, options) # :nodoc:
         cascade(:delete_entry, key, options)
         true
+      end
+
+      private
+
+      def write_missing_entry(key, entry, options, store_index)
+        @stores[0...store_index].each do |store|
+          store.send(:write_entry, key, entry, options)
+        end
       end
     end
   end

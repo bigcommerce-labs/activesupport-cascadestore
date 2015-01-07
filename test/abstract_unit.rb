@@ -11,7 +11,6 @@ lib = File.expand_path("#{File.dirname(__FILE__)}/../lib")
 $:.unshift(lib) unless $:.include?('lib') || $:.include?(lib)
 
 require 'active_support/core_ext/kernel/reporting'
-require 'active_support/core_ext/string/encoding'
 
 silence_warnings do
   Encoding.default_internal = "UTF-8"
@@ -22,6 +21,7 @@ require 'minitest/autorun'
 # require 'empty_bool'
 
 silence_warnings { require 'mocha' }
+require 'mocha/test_unit'
 
 ENV['NO_RELOAD'] = '1'
 require 'active_support'

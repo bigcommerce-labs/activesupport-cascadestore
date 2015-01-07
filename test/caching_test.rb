@@ -1,6 +1,9 @@
 require 'logger'
 require 'abstract_unit'
 require 'active_support/cache'
+require 'active_support/cache'
+require 'active_support/cache/mem_cache_store'
+require 'memcached_store'
 
 # Tests the base functionality that should be identical across all cache stores.
 module CacheStoreBehavior
@@ -76,16 +79,16 @@ module CacheStoreBehavior
 
   def test_read_and_write_compressed_small_data
     @cache.write('foo', 'bar', :compress => true)
-    raw_value = @cache.send(:read_entry, 'foo', {}).raw_value
+    value = @cache.send(:read_entry, 'foo', {}).value
     assert_equal 'bar', @cache.read('foo')
-    assert_equal 'bar', Marshal.load(raw_value)
+    assert_equal 'bar', value
   end
 
   def test_read_and_write_compressed_large_data
     @cache.write('foo', 'bar', :compress => true, :compress_threshold => 2)
-    raw_value = @cache.send(:read_entry, 'foo', {}).raw_value
+    value = @cache.send(:read_entry, 'foo', {}).value
     assert_equal 'bar', @cache.read('foo')
-    assert_equal 'bar', Marshal.load(Zlib::Inflate.inflate(raw_value))
+    assert_equal 'bar', value
   end
 
   def test_read_and_write_compressed_nil
@@ -144,14 +147,6 @@ module CacheStoreBehavior
     assert !@cache.exist?('foo')
   end
 
-  def test_read_should_return_a_different_object_id_each_time_it_is_called
-    @cache.write('foo', 'bar')
-    assert_not_equal @cache.read('foo').object_id, @cache.read('foo').object_id
-    value = @cache.read('foo')
-    value << 'bingo'
-    assert_not_equal value, @cache.read('foo')
-  end
-
   def test_original_store_objects_should_not_be_immutable
     bar = 'bar'
     @cache.write('foo', bar)
@@ -170,6 +165,7 @@ module CacheStoreBehavior
 
     Time.stubs(:now).returns(time + 61)
     assert_nil @cache.read('foo')
+    Time.unstub(:now)
   end
 
   def test_race_condition_protection
@@ -181,6 +177,7 @@ module CacheStoreBehavior
       "baz"
     end
     assert_equal "baz", result
+    Time.unstub(:now)
   end
 
   def test_race_condition_protection_is_limited
@@ -192,6 +189,7 @@ module CacheStoreBehavior
       "baz"
     end
     assert_equal "baz", result
+    Time.unstub(:now)
   end
 
   def test_race_condition_protection_is_safe
@@ -208,6 +206,7 @@ module CacheStoreBehavior
     assert_equal "bar", @cache.read('foo')
     Time.stubs(:now).returns(time + 71)
     assert_nil @cache.read('foo')
+    Time.unstub(:now)
   end
 
   def test_crazy_key_characters
@@ -230,6 +229,14 @@ module CacheStoreBehavior
     assert_nil @cache.read("#{key}x")
     assert_equal({key => "bar"}, @cache.read_multi(key))
     assert @cache.delete(key)
+  end
+
+  def test_missed_read_writes_to_higher_level_stores
+    @store2.write('foo', 'bar')
+    assert_equal 'bar', @store2.read('foo')
+    assert_nil @store1.read('foo')
+    assert_equal 'bar', @cache.read('foo')
+    assert_equal 'bar', @store1.read('foo')
   end
 end
 
@@ -282,44 +289,7 @@ module CacheDeleteMatchedBehavior
   end
 end
 
-module CacheIncrementDecrementBehavior
-  def test_increment
-    @cache.write('foo', 1, :raw => true)
-    assert_equal 1, @cache.read('foo').to_i
-    assert_equal 2, @cache.increment('foo')
-    assert_equal 2, @cache.read('foo').to_i
-    assert_equal 3, @cache.increment('foo')
-    assert_equal 3, @cache.read('foo').to_i
-  end
-
-  def test_decrement
-    @cache.write('foo', 3, :raw => true)
-    assert_equal 3, @cache.read('foo').to_i
-    assert_equal 2, @cache.decrement('foo')
-    assert_equal 2, @cache.read('foo').to_i
-    assert_equal 1, @cache.decrement('foo')
-    assert_equal 1, @cache.read('foo').to_i
-  end
-end
-
-class CascadeStoreTest < ActiveSupport::TestCase
-  def setup
-    @cache = ActiveSupport::Cache.lookup_store(:cascade_store, {
-      :expires_in => 60,
-      :stores => [
-        :memory_store,
-        [:memory_store, :expires_in => 60]
-      ]
-    })
-    @store1 = @cache.stores[0]
-    @store2 = @cache.stores[1]
-  end
-
-  include CacheStoreBehavior
-  include CacheIncrementDecrementBehavior
-  include CacheDeleteMatchedBehavior
-  include EncodedKeyCacheBehavior
-
+module MultipleCacheBehaviour
   def test_default_child_store_options
     assert_equal @store1.options[:expires_in], 60
   end
@@ -360,6 +330,84 @@ class CascadeStoreTest < ActiveSupport::TestCase
     assert_equal @store2.read('foo'), nil
   end
 
+  def test_write_last_store
+    @cache.write('foo', 'bar', last_store: true)
+    assert_equal @store1.read('foo'), nil
+    assert_equal @store2.read('foo'), 'bar'
+  end
+
+  def test_read_last_store
+    @store1.write('foo', 'bar')
+    @store2.write('foo', 'bar')
+    @store1.expects(:read_entry).never
+    assert_equal @cache.read('foo', last_store: true), 'bar'
+  end
+
+  def test_fetch_last_store
+    @store1.expects(:read_entry).never
+    @store1.expects(:write_entry).never
+    assert_equal 'baz', @cache.fetch('foo', last_store: true) { 'baz' }
+    assert_equal @store2.read('foo'), 'baz'
+  end
+
+  def test_clear
+    @cache.write('foo', 'bar')
+    @cache.clear
+    assert_equal @store1.read('foo'), nil
+    assert_equal @store2.read('foo'), nil
+  end
+
+end
+
+module CacheIncrementDecrementBehavior
+  def test_increment
+    @cache.write('foo', 1, :raw => true)
+    assert_equal 1, @cache.read('foo').to_i
+    assert_equal 2, @cache.increment('foo')
+    assert_equal 2, @cache.read('foo').to_i
+    assert_equal 3, @cache.increment('foo')
+    assert_equal 3, @cache.read('foo').to_i
+  end
+
+  def test_decrement
+    @cache.write('foo', 3, :raw => true)
+    assert_equal 3, @cache.read('foo').to_i
+    assert_equal 2, @cache.decrement('foo')
+    assert_equal 2, @cache.read('foo').to_i
+    assert_equal 1, @cache.decrement('foo')
+    assert_equal 1, @cache.read('foo').to_i
+  end
+end
+
+class MemoryStoresTest < ActiveSupport::TestCase
+  def setup
+    @cache = ActiveSupport::Cache.lookup_store(:cascade_store, {
+      :expires_in => 60,
+      :stores => [
+        :memory_store,
+        [:memory_store, :expires_in => 60]
+      ]
+    })
+    @store1 = @cache.stores[0]
+    @store2 = @cache.stores[1]
+  end
+
+  include CacheStoreBehavior
+  include CacheIncrementDecrementBehavior
+  include CacheDeleteMatchedBehavior
+  include EncodedKeyCacheBehavior
+  include MultipleCacheBehaviour
+
+  def test_cleanup
+    time = Time.now
+    @cache.write('foo', 'bar', expires_in: 30)
+    Time.stubs(:now).returns(time + 31)
+    @cache.cleanup
+    assert_equal @store1.read('foo'), nil
+    assert_equal @store2.read('foo'), nil
+    Time.unstub(:now)
+  end
+
   def test_cascade_increment_partial_returns_num
     @store2.write('foo', 0)
     assert_equal @cache.increment('foo', 1), 1
@@ -371,4 +419,24 @@ class CascadeStoreTest < ActiveSupport::TestCase
     assert_equal @cache.decrement('foo', 1), 0
     assert_equal @cache.read('foo'), 0
   end
+end
+
+class MemoryMemcachedStoresTest < ActiveSupport::TestCase
+  def setup
+    @cache = ActiveSupport::Cache.lookup_store(:cascade_store, {
+      :expires_in => 60,
+      :stores => [
+        :memory_store,
+        [:memcached_store, :expires_in => 60]
+      ]
+    })
+    @store1 = @cache.stores[0]
+    @store2 = @cache.stores[1]
+    @cache.clear
+  end
+
+  include CacheStoreBehavior
+  include CacheIncrementDecrementBehavior
+  include EncodedKeyCacheBehavior
+  include MultipleCacheBehaviour
 end
